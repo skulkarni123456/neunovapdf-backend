@@ -1,98 +1,124 @@
-# app.py
-import os
-import time
-from threading import Thread
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
 from PIL import Image
+import io
 import fitz  # PyMuPDF
-import zipfile
-
-UPLOAD_FOLDER = "/tmp/uploads"  # use /tmp on Render (ephemeral)
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+import threading
+import time
 
 app = Flask(__name__)
-CORS(app)  # allow all origins; tighten later if needed
-app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024  # max 512 MB per request
+CORS(app, origins=["https://neunovapdfneunovapdf-org.web.app",
+  "https://neunovapdf-backend.onrender.com",
+  "http://localhost:5000"])
 
-def cleanup_worker(folder=UPLOAD_FOLDER, age_seconds=300):
+# ==========================
+#   GLOBAL VARIABLES
+# ==========================
+stats = {
+    "active_users": 0,
+    "total_conversions": 0,
+    "active_conversions": 0
+}
+
+# Dictionary to track user activity
+user_activity = {}
+
+
+# ==========================
+#   CLEANUP FUNCTION
+# ==========================
+def cleanup_inactive_users():
+    """Removes users inactive for >60s from the counter"""
     while True:
-        try:
-            now = time.time()
-            for name in os.listdir(folder):
-                path = os.path.join(folder, name)
-                try:
-                    if os.path.isfile(path) and (now - os.path.getmtime(path) > age_seconds):
-                        os.remove(path)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        time.sleep(60)
+        now = time.time()
+        inactive_users = [
+            user for user, last_seen in user_activity.items() if now - last_seen > 60
+        ]
+        for user in inactive_users:
+            user_activity.pop(user, None)
+        stats["active_users"] = len(user_activity)
+        time.sleep(30)
 
+
+# Run cleanup thread in background
+threading.Thread(target=cleanup_inactive_users, daemon=True).start()
+
+
+# ==========================
+#   ROUTES
+# ==========================
 @app.route("/")
 def home():
     return jsonify({"status": "NeunovaPDF backend running"})
 
-@app.route("/jpg_to_pdf", methods=["POST"])
+
+@app.route("/jpg-to-pdf", methods=["POST"])
 def jpg_to_pdf():
-    files = request.files.getlist("files")
-    quality = request.form.get("quality", "veryhigh")  # low, medium, high, veryhigh
-    merge_after = request.form.get("merge_after", "true").lower() in ("1", "true", "yes")
+    try:
+        stats["active_conversions"] += 1
+        user_ip = request.remote_addr
+        user_activity[user_ip] = time.time()
+        stats["active_users"] = len(user_activity)
 
-    if not files:
-        return jsonify({"error": "No files uploaded"}), 400
+        # Retrieve quality setting
+        quality = request.form.get("quality", "medium")
+        quality_map = {
+            "low": 50,
+            "medium": 70,
+            "high": 85,
+            "very_high": 100
+        }
+        quality_value = quality_map.get(quality, 100)
 
-    saved_paths = []
-    for f in files:
-        filename = secure_filename(f.filename)
-        if filename == "":
-            continue
-        path = os.path.join(UPLOAD_FOLDER, f"{int(time.time()*1000)}_{filename}")
-        f.save(path)
-        saved_paths.append(path)
+        # Process images
+        images = request.files.getlist("images")
+        if not images:
+            stats["active_conversions"] -= 1
+            return jsonify({"error": "No images uploaded"}), 400
 
-    # Convert images to RGB and optionally resize depending on quality
-    pil_images = []
-    for p in saved_paths:
-        im = Image.open(p).convert("RGB")
-        if quality == "low":
-            im = im.resize((int(im.width * 0.4), int(im.height * 0.4)))
-        elif quality == "medium":
-            im = im.resize((int(im.width * 0.7), int(im.height * 0.7)))
-        elif quality == "high":
-            im = im.resize((int(im.width * 0.9), int(im.height * 0.9)))
-        # veryhigh -> no resizing
-        pil_images.append(im)
+        pdf_bytes = io.BytesIO()
+        pdf = fitz.open()
 
-    out_pdf = os.path.join(UPLOAD_FOLDER, f"converted_{int(time.time())}.pdf")
-    pil_images[0].save(out_pdf, save_all=True, append_images=pil_images[1:])
-    return send_file(out_pdf, as_attachment=True, download_name="converted.pdf")
+        for img_file in images:
+            img = Image.open(img_file.stream).convert("RGB")
 
-@app.route("/pdf_to_jpg", methods=["POST"])
-def pdf_to_jpg():
-    f = request.files.get("file")
-    if not f:
-        return jsonify({"error": "No file uploaded"}), 400
-    filename = secure_filename(f.filename)
-    path = os.path.join(UPLOAD_FOLDER, f"{int(time.time()*1000)}_{filename}")
-    f.save(path)
+            # Compress image quality
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format="JPEG", quality=quality_value)
+            img_bytes.seek(0)
 
-    pdf = fitz.open(path)
-    out_zip = os.path.join(UPLOAD_FOLDER, f"converted_images_{int(time.time())}.zip")
-    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for i, page in enumerate(pdf, start=1):
-            pix = page.get_pixmap()
-            img_path = os.path.join(UPLOAD_FOLDER, f"{int(time.time()*1000)}_page_{i}.jpg")
-            pix.save(img_path)
-            zf.write(img_path, arcname=os.path.basename(img_path))
-    pdf.close()
-    return send_file(out_zip, as_attachment=True, download_name="converted_images.zip")
+            # Add to PDF
+            pdf_page = pdf.new_page(width=img.width, height=img.height)
+            rect = fitz.Rect(0, 0, img.width, img.height)
+            pdf_page.insert_image(rect, stream=img_bytes.getvalue())
 
+        pdf.save(pdf_bytes)
+        pdf_bytes.seek(0)
+        pdf.close()
+
+        stats["total_conversions"] += 1
+        stats["active_conversions"] -= 1
+
+        return send_file(
+            pdf_bytes,
+            as_attachment=True,
+            download_name="converted.pdf",
+            mimetype="application/pdf"
+        )
+
+    except Exception as e:
+        stats["active_conversions"] = max(0, stats["active_conversions"] - 1)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/stats", methods=["GET"])
+def get_stats():
+    """Returns live usage statistics"""
+    return jsonify(stats)
+
+
+# ==========================
+#   MAIN ENTRY
+# ==========================
 if __name__ == "__main__":
-    # start cleanup thread
-    t = Thread(target=cleanup_worker, daemon=True)
-    t.start()
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
