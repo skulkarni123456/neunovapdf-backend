@@ -1,124 +1,105 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from PIL import Image
-import io
 import fitz  # PyMuPDF
-import threading
-import time
+import os, io, time
+from datetime import datetime
 
 app = Flask(__name__)
-CORS(app, origins=["https://neunovapdfneunovapdf-org.web.app",
-  "https://neunovapdf-backend.onrender.com",
-  "http://localhost:5000"])
+CORS(app)
 
-# ==========================
-#   GLOBAL VARIABLES
-# ==========================
+UPLOAD_FOLDER = '/tmp/uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# -----------------------------
+# 📊 GLOBAL STATS
+# -----------------------------
 stats = {
-    "active_users": 0,
+    "start_time": datetime.utcnow().isoformat(),
     "total_conversions": 0,
-    "active_conversions": 0
+    "active_conversions": 0,
+    "active_users": 0
 }
 
-# Dictionary to track user activity
-user_activity = {}
-
-
-# ==========================
-#   CLEANUP FUNCTION
-# ==========================
-def cleanup_inactive_users():
-    """Removes users inactive for >60s from the counter"""
-    while True:
-        now = time.time()
-        inactive_users = [
-            user for user, last_seen in user_activity.items() if now - last_seen > 60
-        ]
-        for user in inactive_users:
-            user_activity.pop(user, None)
-        stats["active_users"] = len(user_activity)
-        time.sleep(30)
-
-
-# Run cleanup thread in background
-threading.Thread(target=cleanup_inactive_users, daemon=True).start()
-
-
-# ==========================
-#   ROUTES
-# ==========================
-@app.route("/")
+# -----------------------------
+# ✅ HEALTH CHECK
+# -----------------------------
+@app.route('/')
 def home():
     return jsonify({"status": "NeunovaPDF backend running"})
 
-
-@app.route("/jpg-to-pdf", methods=["POST"])
-def jpg_to_pdf():
-    try:
-        stats["active_conversions"] += 1
-        user_ip = request.remote_addr
-        user_activity[user_ip] = time.time()
-        stats["active_users"] = len(user_activity)
-
-        # Retrieve quality setting
-        quality = request.form.get("quality", "medium")
-        quality_map = {
-            "low": 50,
-            "medium": 70,
-            "high": 85,
-            "very_high": 100
-        }
-        quality_value = quality_map.get(quality, 100)
-
-        # Process images
-        images = request.files.getlist("images")
-        if not images:
-            stats["active_conversions"] -= 1
-            return jsonify({"error": "No images uploaded"}), 400
-
-        pdf_bytes = io.BytesIO()
-        pdf = fitz.open()
-
-        for img_file in images:
-            img = Image.open(img_file.stream).convert("RGB")
-
-            # Compress image quality
-            img_bytes = io.BytesIO()
-            img.save(img_bytes, format="JPEG", quality=quality_value)
-            img_bytes.seek(0)
-
-            # Add to PDF
-            pdf_page = pdf.new_page(width=img.width, height=img.height)
-            rect = fitz.Rect(0, 0, img.width, img.height)
-            pdf_page.insert_image(rect, stream=img_bytes.getvalue())
-
-        pdf.save(pdf_bytes)
-        pdf_bytes.seek(0)
-        pdf.close()
-
-        stats["total_conversions"] += 1
-        stats["active_conversions"] -= 1
-
-        return send_file(
-            pdf_bytes,
-            as_attachment=True,
-            download_name="converted.pdf",
-            mimetype="application/pdf"
-        )
-
-    except Exception as e:
-        stats["active_conversions"] = max(0, stats["active_conversions"] - 1)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/stats", methods=["GET"])
+# -----------------------------
+# 📈 STATS ENDPOINT
+# -----------------------------
+@app.route('/stats', methods=['GET'])
 def get_stats():
-    """Returns live usage statistics"""
-    return jsonify(stats)
+    uptime_seconds = (datetime.utcnow() - datetime.fromisoformat(stats["start_time"])).seconds
+    return jsonify({
+        "active_users": stats["active_users"],
+        "total_conversions": stats["total_conversions"],
+        "active_conversions": stats["active_conversions"],
+        "uptime_seconds": uptime_seconds
+    })
 
+@app.before_request
+def before_request():
+    stats["active_users"] += 1
 
-# ==========================
-#   MAIN ENTRY
-# ==========================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+@app.after_request
+def after_request(response):
+    stats["active_users"] = max(stats["active_users"] - 1, 0)
+    return response
+
+# -----------------------------
+# 🖼 JPG → PDF
+# -----------------------------
+@app.route('/jpg_to_pdf', methods=['POST'])
+def jpg_to_pdf():
+    stats["active_conversions"] += 1
+    try:
+        files = request.files.getlist('files')
+        if not files:
+            return jsonify({"error": "No files uploaded"}), 400
+
+        images = []
+        for file in files:
+            filename = str(int(time.time() * 1000)) + "_" + file.filename
+            path = os.path.join(UPLOAD_FOLDER, filename)
+            file.save(path)
+
+            try:
+                im = Image.open(path)
+                im.verify()  # Validate image
+                im = Image.open(path).convert("RGB")
+                images.append(im)
+            except Exception as e:
+                return jsonify({"error": f"Invalid image: {str(e)}"}), 400
+
+        pdf_path = os.path.join(UPLOAD_FOLDER, f"{int(time.time())}_output.pdf")
+        images[0].save(pdf_path, save_all=True, append_images=images[1:])
+        stats["total_conversions"] += 1
+        return send_file(pdf_path, as_attachment=True)
+
+    finally:
+        stats["active_conversions"] = max(stats["active_conversions"] - 1, 0)
+
+# -----------------------------
+# 🧹 DELETE OLD FILES
+# -----------------------------
+@app.after_request
+def cleanup(response):
+    now = time.time()
+    for f in os.listdir(UPLOAD_FOLDER):
+        path = os.path.join(UPLOAD_FOLDER, f)
+        if os.path.isfile(path) and now - os.path.getmtime(path) > 180:
+            try:
+                os.remove(path)
+            except:
+                pass
+    return response
+
+# -----------------------------
+# 🚀 START
+# -----------------------------
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
