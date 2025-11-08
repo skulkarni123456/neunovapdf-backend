@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+uploads/
+*.zip
+*.pdf
+*.jpg
+.env
