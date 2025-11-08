@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from PIL import Image
 import fitz  # PyMuPDF
-import os, io, time
+import os, io, time, zipfile
 from datetime import datetime
 
 app = Flask(__name__)
@@ -79,6 +79,41 @@ def jpg_to_pdf():
         images[0].save(pdf_path, save_all=True, append_images=images[1:])
         stats["total_conversions"] += 1
         return send_file(pdf_path, as_attachment=True)
+
+    finally:
+        stats["active_conversions"] = max(stats["active_conversions"] - 1, 0)
+
+# -----------------------------
+# 📄 PDF → JPG
+# -----------------------------
+@app.route('/pdf_to_jpg', methods=['POST'])
+def pdf_to_jpg():
+    stats["active_conversions"] += 1
+    try:
+        file = request.files.get('file')
+        if not file:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        filename = str(int(time.time() * 1000)) + "_" + file.filename
+        pdf_path = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(pdf_path)
+
+        doc = fitz.open(pdf_path)
+        image_paths = []
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap()
+            img_path = os.path.join(UPLOAD_FOLDER, f"page_{i + 1}.jpg")
+            pix.save(img_path)
+            image_paths.append(img_path)
+
+        # Bundle all JPGs into one ZIP
+        zip_path = os.path.join(UPLOAD_FOLDER, f"{int(time.time())}_pdf_to_jpg.zip")
+        with zipfile.ZipFile(zip_path, "w") as zipf:
+            for img in image_paths:
+                zipf.write(img, os.path.basename(img))
+
+        stats["total_conversions"] += 1
+        return send_file(zip_path, as_attachment=True)
 
     finally:
         stats["active_conversions"] = max(stats["active_conversions"] - 1, 0)
